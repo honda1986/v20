@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 v20_ana 完全統合版 Streamlitアプリ
-★ 100並列高速処理 ＋ スジ連動予測(23次元) ＋ キューマスター完全対応
+★ 100並列高速処理 ＋ スジ連動予測(23次元) ＋ キューマスター完全対応（修正版）
 """
 import re
 import json
@@ -26,7 +26,6 @@ JST = timezone(timedelta(hours=+9), 'JST')
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 req_session = requests.Session()
 req_session.headers.update(UA)
-# 100並列に耐えられるようにコネクションプールを100に設定
 adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=3)
 req_session.mount('https://', adapter)
 req_session.mount('http://', adapter)
@@ -37,6 +36,14 @@ JCD_NAME = {
     13:"尼崎", 14:"鳴門", 15:"丸亀", 16:"児島", 17:"宮島", 18:"徳山",
     19:"下関", 20:"若松", 21:"芦屋", 22:"福岡", 23:"唐津", 24:"大村"
 }
+
+# ボタン押下時の画面リセットを防ぐためのセッション状態初期化
+if "df_results" not in st.session_state:
+    st.session_state.df_results = None
+if "auto_bet_queue" not in st.session_state:
+    st.session_state.auto_bet_queue = []
+if "summary_text" not in st.session_state:
+    st.session_state.summary_text = ""
 
 # ============================================================
 # 1. モデルの読み込み (v20 スジ連動モデル)
@@ -98,7 +105,6 @@ def fetch_kyotei24_data(jcd, rno, date_str):
 
     soup = BeautifulSoup(html, "html.parser")
     
-    # 結果取得
     lane_to_rank = {}
     jyuni_divs = soup.find_all('div', class_='jyuni')
     has_result = False
@@ -173,7 +179,7 @@ def fetch_kyotei24_data(jcd, rno, date_str):
     return racers, actual_result, payoff, has_result
 
 # ============================================================
-# 4. v20 スジ連動・確率計算ロジック (LightGBMError対策済)
+# 4. v20 スジ連動・確率計算ロジック
 # ============================================================
 def calculate_v20_probs(jcd, racers):
     pairs_features = []
@@ -200,7 +206,6 @@ def calculate_v20_probs(jcd, racers):
         
     df_pairs = pd.DataFrame(pairs_features)
     
-    # ★学習時と全く同じカラム順序に強制ソート（エラー防止の要）
     features_order = [
         '場', 'A_枠', 'A_級', 'A_ST', 'A_勝率', 'A_モータ',
         'A_勝率偏差', 'A_内ST差', 'A_外ST差',
@@ -254,8 +259,9 @@ bet_amount = st.sidebar.number_input("1点あたりの購入金額 (円)", min_v
 
 def process_single_race(jcd, rno, dstr):
     res = fetch_kyotei24_data(jcd, rno, dstr)
+    # ★修正箇所：開催がない（データがない）レースはNoneを返す
     if not res:
-        return {"日付": dstr, "場": JCD_NAME[jcd], "R": f"{rno}R", "買い目": "データなし", "結果": "-", "結果確率": "-", "的中": "-", "払戻金": 0, "点数": 0}
+        return None
         
     racers, actual_result, payoff, has_result = res
     probs = calculate_v20_probs(jcd, racers)
@@ -267,7 +273,8 @@ def process_single_race(jcd, rno, dstr):
     count = 0
     hit_mark = "❌"
     result_prob_str = "-"
-    actual_payoff = 0
+    actual_payoff = payoff if has_result else 0 # ★修正箇所：外れた場合も実際の払戻金を入れる
+    my_payout = 0 # 回収率計算用の内部変数
     
     if buy_bets:
         kaime_str = ", ".join([f"{b['bet']}({b['prob']}%)" for b in buy_bets])
@@ -281,7 +288,7 @@ def process_single_race(jcd, rno, dstr):
             for b in buy_bets:
                 if b["bet"] == actual_result:
                     hit_mark = "🎯"
-                    actual_payoff = payoff
+                    my_payout = payoff # 的中時のみ自分の回収データに加算
                     break
         
     return {
@@ -289,7 +296,8 @@ def process_single_race(jcd, rno, dstr):
         "買い目": kaime_str, "結果": actual_result if has_result else "結果待ち", 
         "結果確率": result_prob_str if has_result else "⏳", 
         "的中": hit_mark if has_result else "-", 
-        "払戻金": actual_payoff, "点数": count
+        "払戻金": actual_payoff, "点数": count,
+        "my_payout": my_payout
     }
 
 st.title("🚤 v20 波乱特化AI (完全統合・キューマスター対応)")
@@ -302,54 +310,67 @@ if st.button("🚀 予想 / バックテストを実行"):
     results_disp = []
     tasks = [(j, r) for j in target_jcds for r in range(1, 13)]
     
-    # 100並列による超高速処理
     with st.spinner(f"⚡ データ取得＆予測中 (全 {len(tasks)} レース)..."):
         with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
             future_to_task = {executor.submit(process_single_race, j, r, date_str): (j, r) for j, r in tasks}
             for future in concurrent.futures.as_completed(future_to_task):
-                results_disp.append(future.result())
+                res_val = future.result()
+                # ★修正箇所：開催なし(None)のレースをスキップ
+                if res_val is not None:
+                    results_disp.append(res_val)
                 
-    df = pd.DataFrame(results_disp)
-    df['場_id'] = df['場'].map({v: k for k, v in JCD_NAME.items()})
-    df['R_num'] = df['R'].str.replace('R', '').astype(int)
-    df = df.sort_values(by=['場_id', 'R_num']).drop(columns=['場_id', 'R_num']).reset_index(drop=True)
-    
-    total_bets = df["点数"].sum()
-    total_cost = total_bets * bet_amount
-    total_payoff = df["払戻金"].sum() * (bet_amount / 100)
-    roi = (total_payoff / total_cost * 100) if total_cost > 0 else 0
-    
-    st.success(f"✅ 処理完了！ 購入点数: {total_bets}点 (投資: {total_cost:,.0f}円) / 回収: {total_payoff:,.0f}円 / 回収率: {roi:.1f}%")
+    if results_disp:
+        df = pd.DataFrame(results_disp)
+        df['場_id'] = df['場'].map({v: k for k, v in JCD_NAME.items()})
+        df['R_num'] = df['R'].str.replace('R', '').astype(int)
+        df = df.sort_values(by=['場_id', 'R_num']).drop(columns=['場_id', 'R_num']).reset_index(drop=True)
+        
+        total_bets = df["点数"].sum()
+        total_cost = total_bets * bet_amount
+        total_payoff = df["my_payout"].sum() * (bet_amount / 100) # 的中時のみを合計
+        roi = (total_payoff / total_cost * 100) if total_cost > 0 else 0
+        
+        st.session_state.summary_text = f"✅ 処理完了！ 購入点数: {total_bets}点 (投資: {total_cost:,.0f}円) / 回収: {total_payoff:,.0f}円 / 回収率: {roi:.1f}%"
+        st.session_state.df_results = df
+        
+        # キューマスター用一時データの作成
+        auto_bet_queue = []
+        for index, row in df.iterrows():
+            if row["点数"] > 0 and row["買い目"] != "見" and row["買い目"] != "データなし":
+                bets = row["買い目"].split(", ")
+                for bet_str in bets:
+                    try:
+                        clean_bet = bet_str.split("(")[0]
+                        pattern = [int(x) for x in clean_bet.split("-")]
+                        queue_item = {
+                            "venue": row["場"],
+                            "race": str(row["R"]).replace("R", ""),
+                            "pattern": pattern,
+                            "amount": str(bet_amount)
+                        }
+                        auto_bet_queue.append(queue_item)
+                    except:
+                        pass
+        st.session_state.auto_bet_queue = auto_bet_queue
+    else:
+        st.session_state.df_results = None
+        st.session_state.auto_bet_queue = []
+        st.session_state.summary_text = ""
+        st.warning("開催されているレースが見つかりませんでした。")
 
+# 結果の描画（セッション状態から読み込むことでボタン押下時の消失を防ぐ）
+if st.session_state.df_results is not None:
+    st.success(st.session_state.summary_text)
     disp_cols = ["日付", "場", "R", "買い目", "結果", "結果確率", "的中", "払戻金"]
-    st.dataframe(df[disp_cols], use_container_width=True)
+    st.dataframe(st.session_state.df_results[disp_cols], use_container_width=True)
 
-    # ============================================================
-    # 6. 全自動購入用データ (キューマスター専用) 生成
-    # ============================================================
-    auto_bet_queue = []
-    for index, row in df.iterrows():
-        if row["点数"] > 0 and row["買い目"] != "見" and row["買い目"] != "データなし":
-            bets = row["買い目"].split(", ")
-            for bet_str in bets:
-                try:
-                    clean_bet = bet_str.split("(")[0]
-                    pattern = [int(x) for x in clean_bet.split("-")]
-                    queue_item = {
-                        "venue": row["場"],
-                        "race": str(row["R"]).replace("R", ""),
-                        "pattern": pattern,
-                        "amount": str(bet_amount)
-                    }
-                    auto_bet_queue.append(queue_item)
-                except:
-                    pass
-    
-    if auto_bet_queue:
-        json_string = json.dumps(auto_bet_queue, ensure_ascii=False, indent=4)
+    if st.session_state.auto_bet_queue:
         st.markdown("---")
         st.subheader("🤖 全自動購入用データ (キューマスター専用)")
-        st.caption("右上のコピーボタンを押して、キューマスターに貼り付けてください。")
-        st.code(json_string, language="json")
+        # ★修正箇所：ボタンを押した時だけデータをコードブロックに生成する
+        if st.button("キューマスター用JSONデータを生成"):
+            json_string = json.dumps(st.session_state.auto_bet_queue, ensure_ascii=False, indent=4)
+            st.caption("右上のコピーボタンを押して、キューマスターに貼り付けてください。")
+            st.code(json_string, language="json")
     else:
         st.info("条件に合致する買い目がありませんでした。設定（閾値など）を見直してください。")
